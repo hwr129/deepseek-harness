@@ -7,7 +7,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type z from '@deepseek-ai/schemastery'
+import z from '@deepseek-ai/schemastery'
 import { redactSecrets } from './redact.ts'
 import type { RedactedSecret } from './redact.ts'
 import type { SettingsNamespace, SettingsUpdateSource } from './types.ts'
@@ -444,7 +444,7 @@ export abstract class SettingsProvider extends Service {
       ...options?.validate === undefined
         ? {}
         : { validate: options.validate as (value: unknown) => void },
-      resolved: deepFreeze(this.resolve(schema, options?.base, this.section(ns), options?.validate)),
+      resolved: deepFreeze(this.resolveSafe(ns, schema, options?.base, this.section(ns), options?.validate)),
       revision: 0,
       watchers: new Set(),
     }
@@ -630,7 +630,7 @@ export abstract class SettingsProvider extends Service {
         : mode === 'replace'
           ? snapshot
           : (snapshot['ops'] as SettingsPathOp[]).reduce(applyPathOp, current)
-      const next = deepFreeze(this.resolve(registration.schema, registration.base, section, registration.validate))
+      const next = deepFreeze(this.resolveSafe(ns, registration.schema, registration.base, section, registration.validate))
       await this.persist(ns, section)
       // The write reached storage either way; the cache must say so. Commit
       // only when this registration is still the namespace owner — a fiber
@@ -672,7 +672,9 @@ export abstract class SettingsProvider extends Service {
     for (const registration of this.registrations.values()) {
       let next: unknown
       try {
-        next = deepFreeze(this.resolve(registration.schema, registration.base, this.section(registration.ns), registration.validate))
+        next = deepFreeze(this.resolveSafe(
+          registration.ns, registration.schema, registration.base, this.section(registration.ns), registration.validate,
+        ))
       } catch (error) {
         this.ctx.logger.warn('settings: keeping last good "%s" after invalid stored section', registration.ns)
         this.ctx.logger.warn(error)
@@ -707,6 +709,35 @@ export abstract class SettingsProvider extends Service {
     // and the composition base exactly as the owner will.
     validate?.(value)
     return value
+  }
+
+  /**
+   * {@link resolve}, with a schema `ValidationError`'s message replaced by a
+   * value-free one before it can reach a log line or an RPC caller. The
+   * thrown message otherwise quotes the rejected value verbatim (e.g.
+   * `"apiKey expected string but got sk-..."`), and a namespace section can
+   * hold a `role('secret')` field — the same reason `settings-file` never
+   * surfaces a raw YAML parse-error message. Only the field path survives.
+   */
+  private resolveSafe<T>(
+    ns: SettingsNamespace,
+    schema: z<T>,
+    base: unknown,
+    section: Record<string, unknown> | undefined,
+    validate?: (value: T) => void,
+  ): T {
+    try {
+      return this.resolve(schema, base, section, validate)
+    } catch (error) {
+      if (z.ValidationError.is(error)) {
+        const path = error.options.path
+        const at = path === undefined || path.length === 0
+          ? '(root)'
+          : path.map(segment => String(segment)).join('.')
+        throw new TypeError(`settings section "${ns}" failed validation at "${at}"`)
+      }
+      throw error
+    }
   }
 
   /**

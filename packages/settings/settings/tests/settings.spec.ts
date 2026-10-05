@@ -151,6 +151,65 @@ describe('registration', () => {
       .toThrow(/must be an object/)
   })
 
+  describe('validation failures on a role("secret") field', () => {
+    // A settings section can hold provider credentials. schemastery's
+    // ValidationError quotes the rejected value verbatim in its message (the
+    // `expected string but got ${data}` template) — so a numeric-looking
+    // secret that reaches the schema unquoted (e.g. re-typed by a YAML
+    // round-trip, which parses an unquoted digit string as a number) would
+    // otherwise echo its own digits into whatever surface reports the
+    // failure: a log line, or an RPC error response. Mirrors the guard
+    // `settings-file` already has for YAML parse errors on the same document.
+    const SecretSchema: z<{ apiKey: string }> = z.object({
+      apiKey: z.string().role('secret'),
+    })
+    // The digits ARE the secret's content, not just its length — asserting
+    // the message excludes this string is what proves the fix, not a
+    // coincidental non-match.
+    const secretDigits = '48293175'
+
+    it('keeps the secret\'s digits out of a registration failure', async () => {
+      const { ctx } = await boot({ doc: { 'llm-provider': { apiKey: Number(secretDigits) } } })
+      let caught: unknown
+      try {
+        ctx.settings.register(settingsNamespace('llm-provider'), SecretSchema)
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(TypeError)
+      expect(String(caught)).not.toContain(secretDigits)
+      expect(String(caught)).toContain('apiKey')
+    })
+
+    it('keeps the secret\'s digits out of an update rejection', async () => {
+      const { ctx } = await boot({ doc: { 'llm-provider': { apiKey: 'placeholder' } } })
+      ctx.settings.register(settingsNamespace('llm-provider'), SecretSchema)
+      let caught: unknown
+      try {
+        await ctx.settings.update(settingsNamespace('llm-provider'), { apiKey: Number(secretDigits) as unknown as string })
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(TypeError)
+      expect(String(caught)).not.toContain(secretDigits)
+    })
+
+    it('keeps the last good value and does not throw on a publish() external edit with a bad secret', async () => {
+      const { ctx } = await boot({ doc: { 'llm-provider': { apiKey: 'placeholder' } } })
+      const scope = ctx.settings.register(settingsNamespace('llm-provider'), SecretSchema)
+      const before = scope.get()
+      expect(() => {
+        ;(ctx.settings as unknown as { publish(doc: Record<string, unknown>): void })
+          .publish({ 'llm-provider': { apiKey: Number(secretDigits) } })
+      }).not.toThrow()
+      // publish() only logs and keeps the last good value; resolveSafe still
+      // ran on this path; a thrown-and-uncaught raw ValidationError here would
+      // have surfaced as an unhandled rejection from the caller of publish()
+      // in a real provider (see `settings-file`'s document watcher).
+      expect(scope.get()).toEqual(before)
+    })
+  })
+
   it('describes registered namespaces with schema JSON, value, and applies', async () => {
     const { ctx } = await boot()
     ctx.settings.register(settingsNamespace('ui-theme'), ThemeSchema)
